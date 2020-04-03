@@ -8,10 +8,10 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/hashicorp/terraform/helper/acctest"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/acctest"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/terraform"
 )
 
 func TestCleanZoneID(t *testing.T) {
@@ -75,6 +75,30 @@ func TestAccAWSRoute53Zone_basic(t *testing.T) {
 				ImportState:             true,
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{"force_destroy"},
+			},
+		},
+	})
+}
+
+func TestAccAWSRoute53Zone_disappears(t *testing.T) {
+	var zone route53.GetHostedZoneOutput
+
+	rString := acctest.RandString(8)
+	resourceName := "aws_route53_zone.test"
+	zoneName := fmt.Sprintf("%s.terraformtest.com", rString)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckRoute53ZoneDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccRoute53ZoneConfig(zoneName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoute53ZoneExists(resourceName, &zone),
+					testAccCheckRoute53ZoneDisappears(&zone),
+				),
+				ExpectNonEmptyPlan: true,
 			},
 		},
 	})
@@ -225,7 +249,6 @@ func TestAccAWSRoute53Zone_ForceDestroy_TrailingPeriod(t *testing.T) {
 
 func TestAccAWSRoute53Zone_Tags(t *testing.T) {
 	var zone route53.GetHostedZoneOutput
-	var td route53.ResourceTagSet
 
 	rName := acctest.RandomWithPrefix("tf-acc-test")
 	resourceName := "aws_route53_zone.test"
@@ -242,8 +265,6 @@ func TestAccAWSRoute53Zone_Tags(t *testing.T) {
 					testAccCheckRoute53ZoneExists(resourceName, &zone),
 					resource.TestCheckResourceAttr(resourceName, "tags.%", "1"),
 					resource.TestCheckResourceAttr(resourceName, "tags.tag1key", "tag1value"),
-					testAccLoadTagsR53(&zone, &td),
-					testAccCheckTagsR53(&td.Tags, "tag1key", "tag1value"),
 				),
 			},
 			{
@@ -259,9 +280,6 @@ func TestAccAWSRoute53Zone_Tags(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "tags.%", "2"),
 					resource.TestCheckResourceAttr(resourceName, "tags.tag1key", "tag1valueupdated"),
 					resource.TestCheckResourceAttr(resourceName, "tags.tag2key", "tag2value"),
-					testAccLoadTagsR53(&zone, &td),
-					testAccCheckTagsR53(&td.Tags, "tag1key", "tag1valueupdated"),
-					testAccCheckTagsR53(&td.Tags, "tag2key", "tag2value"),
 				),
 			},
 			{
@@ -270,8 +288,6 @@ func TestAccAWSRoute53Zone_Tags(t *testing.T) {
 					testAccCheckRoute53ZoneExists(resourceName, &zone),
 					resource.TestCheckResourceAttr(resourceName, "tags.%", "1"),
 					resource.TestCheckResourceAttr(resourceName, "tags.tag2key", "tag2value"),
-					testAccLoadTagsR53(&zone, &td),
-					testAccCheckTagsR53(&td.Tags, "tag2key", "tag2value"),
 				),
 			},
 		},
@@ -497,6 +513,20 @@ func testAccCheckRoute53ZoneExistsWithProvider(n string, zone *route53.GetHosted
 	}
 }
 
+func testAccCheckRoute53ZoneDisappears(zone *route53.GetHostedZoneOutput) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		conn := testAccProvider.Meta().(*AWSClient).r53conn
+
+		input := &route53.DeleteHostedZoneInput{
+			Id: zone.HostedZone.Id,
+		}
+
+		_, err := conn.DeleteHostedZone(input)
+
+		return err
+	}
+}
+
 func testAccCheckRoute53ZoneAssociatesWithVpc(n string, zone *route53.GetHostedZoneOutput) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[n]
@@ -518,28 +548,6 @@ func testAccCheckRoute53ZoneAssociatesWithVpc(n string, zone *route53.GetHostedZ
 	}
 }
 
-func testAccLoadTagsR53(zone *route53.GetHostedZoneOutput, td *route53.ResourceTagSet) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		conn := testAccProvider.Meta().(*AWSClient).r53conn
-
-		zone := cleanZoneID(*zone.HostedZone.Id)
-		req := &route53.ListTagsForResourceInput{
-			ResourceId:   aws.String(zone),
-			ResourceType: aws.String("hostedzone"),
-		}
-
-		resp, err := conn.ListTagsForResource(req)
-		if err != nil {
-			return err
-		}
-
-		if resp.ResourceTagSet != nil {
-			*td = *resp.ResourceTagSet
-		}
-
-		return nil
-	}
-}
 func testAccCheckDomainName(zone *route53.GetHostedZoneOutput, domain string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		if zone.HostedZone.Name == nil {

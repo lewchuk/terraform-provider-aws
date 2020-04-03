@@ -3,12 +3,11 @@ package aws
 import (
 	"bytes"
 	"fmt"
-	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/hashicorp/terraform/helper/hashcode"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/hashcode"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
 func dataSourceAwsDynamoDbTable() *schema.Resource {
@@ -140,16 +139,11 @@ func dataSourceAwsDynamoDbTable() *schema.Resource {
 			"stream_view_type": {
 				Type:     schema.TypeString,
 				Computed: true,
-				StateFunc: func(v interface{}) string {
-					value := v.(string)
-					return strings.ToUpper(value)
-				},
 			},
 			"tags": tagsSchemaComputed(),
 			"ttl": {
 				Type:     schema.TypeSet,
 				Computed: true,
-				MaxItems: 1,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"attribute_name": {
@@ -178,6 +172,10 @@ func dataSourceAwsDynamoDbTable() *schema.Resource {
 							Type:     schema.TypeBool,
 							Computed: true,
 						},
+						"kms_key_arn": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
 					},
 				},
 			},
@@ -188,7 +186,6 @@ func dataSourceAwsDynamoDbTable() *schema.Resource {
 			"point_in_time_recovery": {
 				Type:     schema.TypeList,
 				Computed: true,
-				MaxItems: 1,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"enabled": {
@@ -224,13 +221,10 @@ func dataSourceAwsDynamoDbTableRead(d *schema.ResourceData, meta interface{}) er
 		TableName: aws.String(d.Id()),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("error describing DynamoDB Table (%s) Time to Live: %s", d.Id(), err)
 	}
-	if ttlOut.TimeToLiveDescription != nil {
-		err := d.Set("ttl", flattenDynamoDbTtl(ttlOut.TimeToLiveDescription))
-		if err != nil {
-			return err
-		}
+	if err := d.Set("ttl", flattenDynamoDbTtl(ttlOut)); err != nil {
+		return fmt.Errorf("error setting ttl: %s", err)
 	}
 
 	tags, err := readDynamoDbTableTags(d.Get("arn").(string), conn)

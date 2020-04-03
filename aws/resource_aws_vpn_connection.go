@@ -14,10 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ec2"
-
-	"github.com/hashicorp/terraform/helper/hashcode"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/hashcode"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 type XmlVpnConnectionConfig struct {
@@ -82,6 +82,11 @@ func resourceAwsVpnConnection() *schema.Resource {
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
+			},
+
+			"transit_gateway_attachment_id": {
+				Type:     schema.TypeString,
+				Computed: true,
 			},
 
 			"transit_gateway_id": {
@@ -311,34 +316,16 @@ func resourceAwsVpnConnectionCreate(d *schema.ResourceData, meta interface{}) er
 		return fmt.Errorf("Error creating vpn connection: %s", err)
 	}
 
-	// Store the ID
-	vpnConnection := resp.VpnConnection
-	d.SetId(*vpnConnection.VpnConnectionId)
-	log.Printf("[INFO] VPN connection ID: %s", *vpnConnection.VpnConnectionId)
+	d.SetId(aws.StringValue(resp.VpnConnection.VpnConnectionId))
 
-	// Wait for the connection to become available. This has an obscenely
-	// high default timeout because AWS VPN connections are notoriously
-	// slow at coming up or going down. There's also no point in checking
-	// more frequently than every ten seconds.
-	stateConf := &resource.StateChangeConf{
-		Pending:    []string{"pending"},
-		Target:     []string{"available"},
-		Refresh:    vpnConnectionRefreshFunc(conn, *vpnConnection.VpnConnectionId),
-		Timeout:    40 * time.Minute,
-		Delay:      10 * time.Second,
-		MinTimeout: 10 * time.Second,
+	if err := waitForEc2VpnConnectionAvailable(conn, d.Id()); err != nil {
+		return fmt.Errorf("error waiting for VPN connection (%s) to become available: %s", d.Id(), err)
 	}
 
-	_, stateErr := stateConf.WaitForState()
-	if stateErr != nil {
-		return fmt.Errorf(
-			"Error waiting for VPN connection (%s) to become ready: %s",
-			*vpnConnection.VpnConnectionId, stateErr)
-	}
-
-	// Create tags.
-	if err := setTags(conn, d); err != nil {
-		return err
+	if v := d.Get("tags").(map[string]interface{}); len(v) > 0 {
+		if err := keyvaluetags.Ec2UpdateTags(conn, d.Id(), nil, v); err != nil {
+			return fmt.Errorf("error adding EC2 VPN Connection (%s) tags: %s", d.Id(), err)
+		}
 	}
 
 	// Read off the API to populate our RO fields.
@@ -375,25 +362,68 @@ func resourceAwsVpnConnectionRead(d *schema.ResourceData, meta interface{}) erro
 	resp, err := conn.DescribeVpnConnections(&ec2.DescribeVpnConnectionsInput{
 		VpnConnectionIds: []*string{aws.String(d.Id())},
 	})
-	if err != nil {
-		if ec2err, ok := err.(awserr.Error); ok && ec2err.Code() == "InvalidVpnConnectionID.NotFound" {
-			d.SetId("")
-			return nil
-		} else {
-			log.Printf("[ERROR] Error finding VPN connection: %s", err)
-			return err
-		}
+
+	if isAWSErr(err, "InvalidVpnConnectionID.NotFound", "") {
+		log.Printf("[WARN] EC2 VPN Connection (%s) not found, removing from state", d.Id())
+		d.SetId("")
+		return nil
 	}
 
-	if len(resp.VpnConnections) != 1 {
-		return fmt.Errorf("Error finding VPN connection: %s", d.Id())
+	if err != nil {
+		return fmt.Errorf("error reading EC2 VPN Connection (%s): %s", d.Id(), err)
+	}
+
+	if resp == nil || len(resp.VpnConnections) == 0 || resp.VpnConnections[0] == nil {
+		return fmt.Errorf("error reading EC2 VPN Connection (%s): empty response", d.Id())
+	}
+
+	if len(resp.VpnConnections) > 1 {
+		return fmt.Errorf("error reading EC2 VPN Connection (%s): multiple responses", d.Id())
 	}
 
 	vpnConnection := resp.VpnConnections[0]
-	if vpnConnection == nil || *vpnConnection.State == "deleted" {
-		// Seems we have lost our VPN Connection
+
+	if aws.StringValue(vpnConnection.State) == ec2.VpnStateDeleted {
+		log.Printf("[WARN] EC2 VPN Connection (%s) already deleted, removing from state", d.Id())
 		d.SetId("")
 		return nil
+	}
+
+	var transitGatewayAttachmentID string
+	if vpnConnection.TransitGatewayId != nil {
+		input := &ec2.DescribeTransitGatewayAttachmentsInput{
+			Filters: []*ec2.Filter{
+				{
+					Name:   aws.String("resource-id"),
+					Values: []*string{vpnConnection.VpnConnectionId},
+				},
+				{
+					Name:   aws.String("resource-type"),
+					Values: []*string{aws.String(ec2.TransitGatewayAttachmentResourceTypeVpn)},
+				},
+				{
+					Name:   aws.String("transit-gateway-id"),
+					Values: []*string{vpnConnection.TransitGatewayId},
+				},
+			},
+		}
+
+		log.Printf("[DEBUG] Finding EC2 VPN Connection Transit Gateway Attachment: %s", input)
+		output, err := conn.DescribeTransitGatewayAttachments(input)
+
+		if err != nil {
+			return fmt.Errorf("error finding EC2 VPN Connection (%s) Transit Gateway Attachment: %s", d.Id(), err)
+		}
+
+		if output == nil || len(output.TransitGatewayAttachments) == 0 || output.TransitGatewayAttachments[0] == nil {
+			return fmt.Errorf("error finding EC2 VPN Connection (%s) Transit Gateway Attachment: empty response", d.Id())
+		}
+
+		if len(output.TransitGatewayAttachments) > 1 {
+			return fmt.Errorf("error reading EC2 VPN Connection (%s) Transit Gateway Attachment: multiple responses", d.Id())
+		}
+
+		transitGatewayAttachmentID = aws.StringValue(output.TransitGatewayAttachments[0].TransitGatewayAttachmentId)
 	}
 
 	// Set attributes under the user's control.
@@ -401,7 +431,10 @@ func resourceAwsVpnConnectionRead(d *schema.ResourceData, meta interface{}) erro
 	d.Set("customer_gateway_id", vpnConnection.CustomerGatewayId)
 	d.Set("transit_gateway_id", vpnConnection.TransitGatewayId)
 	d.Set("type", vpnConnection.Type)
-	d.Set("tags", tagsToMap(vpnConnection.Tags))
+
+	if err := d.Set("tags", keyvaluetags.Ec2KeyValueTags(vpnConnection.Tags).IgnoreAws().Map()); err != nil {
+		return fmt.Errorf("error setting tags: %s", err)
+	}
 
 	if vpnConnection.Options != nil {
 		if err := d.Set("static_routes_only", vpnConnection.Options.StaticRoutesOnly); err != nil {
@@ -414,6 +447,7 @@ func resourceAwsVpnConnectionRead(d *schema.ResourceData, meta interface{}) erro
 
 	// Set read only attributes.
 	d.Set("customer_gateway_configuration", vpnConnection.CustomerGatewayConfiguration)
+	d.Set("transit_gateway_attachment_id", transitGatewayAttachmentID)
 
 	if vpnConnection.CustomerGatewayConfiguration != nil {
 		if tunnelInfo, err := xmlConfigToTunnelInfo(*vpnConnection.CustomerGatewayConfiguration); err != nil {
@@ -447,12 +481,13 @@ func resourceAwsVpnConnectionRead(d *schema.ResourceData, meta interface{}) erro
 func resourceAwsVpnConnectionUpdate(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).ec2conn
 
-	// Update tags if required.
-	if err := setTags(conn, d); err != nil {
-		return err
-	}
+	if d.HasChange("tags") {
+		o, n := d.GetChange("tags")
 
-	d.SetPartial("tags")
+		if err := keyvaluetags.Ec2UpdateTags(conn, d.Id(), o, n); err != nil {
+			return fmt.Errorf("error updating EC2 VPN Connection (%s) tags: %s", d.Id(), err)
+		}
+	}
 
 	return resourceAwsVpnConnectionRead(d, meta)
 }
@@ -463,34 +498,17 @@ func resourceAwsVpnConnectionDelete(d *schema.ResourceData, meta interface{}) er
 	_, err := conn.DeleteVpnConnection(&ec2.DeleteVpnConnectionInput{
 		VpnConnectionId: aws.String(d.Id()),
 	})
+
+	if isAWSErr(err, "InvalidVpnConnectionID.NotFound", "") {
+		return nil
+	}
+
 	if err != nil {
-		if ec2err, ok := err.(awserr.Error); ok && ec2err.Code() == "InvalidVpnConnectionID.NotFound" {
-			return nil
-		} else {
-			log.Printf("[ERROR] Error deleting VPN connection: %s", err)
-			return err
-		}
+		return fmt.Errorf("error deleting VPN Connection (%s): %s", d.Id(), err)
 	}
 
-	// These things can take quite a while to tear themselves down and any
-	// attempt to modify resources they reference (e.g. CustomerGateways or
-	// VPN Gateways) before deletion will result in an error. Furthermore,
-	// they don't just disappear. The go into "deleted" state. We need to
-	// wait to ensure any other modifications the user might make to their
-	// VPC stack can safely run.
-	stateConf := &resource.StateChangeConf{
-		Pending:    []string{"deleting"},
-		Target:     []string{"deleted"},
-		Refresh:    vpnConnectionRefreshFunc(conn, d.Id()),
-		Timeout:    30 * time.Minute,
-		Delay:      10 * time.Second,
-		MinTimeout: 10 * time.Second,
-	}
-
-	_, stateErr := stateConf.WaitForState()
-	if stateErr != nil {
-		return fmt.Errorf(
-			"Error waiting for VPN connection (%s) to delete: %s", d.Id(), err)
+	if err := waitForEc2VpnConnectionDeletion(conn, d.Id()); err != nil {
+		return fmt.Errorf("error waiting for VPN connection (%s) to delete: %s", d.Id(), err)
 	}
 
 	return nil
@@ -531,6 +549,46 @@ func telemetryToMapList(telemetry []*ec2.VgwTelemetry) []map[string]interface{} 
 	}
 
 	return result
+}
+
+func waitForEc2VpnConnectionAvailable(conn *ec2.EC2, id string) error {
+	// Wait for the connection to become available. This has an obscenely
+	// high default timeout because AWS VPN connections are notoriously
+	// slow at coming up or going down. There's also no point in checking
+	// more frequently than every ten seconds.
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"pending"},
+		Target:     []string{"available"},
+		Refresh:    vpnConnectionRefreshFunc(conn, id),
+		Timeout:    40 * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 10 * time.Second,
+	}
+
+	_, err := stateConf.WaitForState()
+
+	return err
+}
+
+func waitForEc2VpnConnectionDeletion(conn *ec2.EC2, id string) error {
+	// These things can take quite a while to tear themselves down and any
+	// attempt to modify resources they reference (e.g. CustomerGateways or
+	// VPN Gateways) before deletion will result in an error. Furthermore,
+	// they don't just disappear. The go into "deleted" state. We need to
+	// wait to ensure any other modifications the user might make to their
+	// VPC stack can safely run.
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"deleting"},
+		Target:     []string{"deleted"},
+		Refresh:    vpnConnectionRefreshFunc(conn, id),
+		Timeout:    30 * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 10 * time.Second,
+	}
+
+	_, err := stateConf.WaitForState()
+
+	return err
 }
 
 func xmlConfigToTunnelInfo(xmlConfig string) (*TunnelInfo, error) {

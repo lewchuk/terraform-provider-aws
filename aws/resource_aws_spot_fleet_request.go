@@ -10,10 +10,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/hashicorp/terraform/helper/hashcode"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/hashicorp/terraform/helper/validation"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/hashcode"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
 )
 
 func resourceAwsSpotFleetRequest() *schema.Resource {
@@ -99,6 +100,12 @@ func resourceAwsSpotFleetRequest() *schema.Resource {
 										Computed: true,
 										ForceNew: true,
 									},
+									"kms_key_id": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Computed: true,
+										ForceNew: true,
+									},
 									"snapshot_id": {
 										Type:     schema.TypeString,
 										Optional: true,
@@ -159,8 +166,20 @@ func resourceAwsSpotFleetRequest() *schema.Resource {
 										Default:  true,
 										ForceNew: true,
 									},
+									"encrypted": {
+										Type:     schema.TypeBool,
+										Optional: true,
+										Computed: true,
+										ForceNew: true,
+									},
 									"iops": {
 										Type:     schema.TypeInt,
+										Optional: true,
+										Computed: true,
+										ForceNew: true,
+									},
+									"kms_key_id": {
+										Type:     schema.TypeString,
 										Optional: true,
 										Computed: true,
 										ForceNew: true,
@@ -239,9 +258,9 @@ func resourceAwsSpotFleetRequest() *schema.Resource {
 							Optional: true,
 							ForceNew: true,
 							StateFunc: func(v interface{}) string {
-								switch v.(type) {
+								switch v := v.(type) {
 								case string:
-									return userDataHashSum(v.(string))
+									return userDataHashSum(v)
 								default:
 									return ""
 								}
@@ -291,11 +310,16 @@ func resourceAwsSpotFleetRequest() *schema.Resource {
 				Default:  1,
 				ForceNew: true,
 			},
+			// Provided constants do not have the correct casing so going with hard-coded values.
 			"excess_capacity_termination_policy": {
 				Type:     schema.TypeString,
 				Optional: true,
 				Default:  "Default",
 				ForceNew: false,
+				ValidateFunc: validation.StringInSlice([]string{
+					"Default",
+					"NoTermination",
+				}, false),
 			},
 			"instance_interruption_behaviour": {
 				Type:     schema.TypeString,
@@ -317,13 +341,13 @@ func resourceAwsSpotFleetRequest() *schema.Resource {
 				Type:         schema.TypeString,
 				Optional:     true,
 				ForceNew:     true,
-				ValidateFunc: validation.ValidateRFC3339TimeString,
+				ValidateFunc: validation.IsRFC3339Time,
 			},
 			"valid_until": {
 				Type:         schema.TypeString,
 				Optional:     true,
 				ForceNew:     true,
-				ValidateFunc: validation.ValidateRFC3339TimeString,
+				ValidateFunc: validation.IsRFC3339Time,
 			},
 			"fleet_type": {
 				Type:     schema.TypeString,
@@ -383,6 +407,14 @@ func buildSpotFleetLaunchSpecification(d map[string]interface{}, meta interface{
 		opts.Placement = placement
 	}
 
+	if v, ok := d["placement_group"]; ok {
+		if v.(string) != "" {
+			// If instanceInterruptionBehavior is set to STOP, this can't be set at all, even to an empty string, so check for "" to avoid those errors
+			placement.GroupName = aws.String(v.(string))
+			opts.Placement = placement
+		}
+	}
+
 	if v, ok := d["ebs_optimized"]; ok {
 		opts.EbsOptimized = aws.Bool(v.(bool))
 	}
@@ -433,7 +465,7 @@ func buildSpotFleetLaunchSpecification(d map[string]interface{}, meta interface{
 	if m, ok := d["tags"].(map[string]interface{}); ok && len(m) > 0 {
 		tagsSpec := make([]*ec2.SpotFleetTagSpecification, 0)
 
-		tags := tagsFromMap(m)
+		tags := keyvaluetags.New(m).IgnoreAws().Ec2Tags()
 
 		spec := &ec2.SpotFleetTagSpecification{
 			ResourceType: aws.String("instance"),
@@ -507,6 +539,10 @@ func readSpotFleetBlockDeviceMappingsFromConfig(
 				ebs.Encrypted = aws.Bool(v)
 			}
 
+			if v, ok := bd["kms_key_id"].(string); ok && v != "" {
+				ebs.KmsKeyId = aws.String(v)
+			}
+
 			if v, ok := bd["volume_size"].(int); ok && v != 0 {
 				ebs.VolumeSize = aws.Int64(int64(v))
 			}
@@ -546,6 +582,14 @@ func readSpotFleetBlockDeviceMappingsFromConfig(
 			bd := v.(map[string]interface{})
 			ebs := &ec2.EbsBlockDevice{
 				DeleteOnTermination: aws.Bool(bd["delete_on_termination"].(bool)),
+			}
+
+			if v, ok := bd["encrypted"].(bool); ok && v {
+				ebs.Encrypted = aws.Bool(v)
+			}
+
+			if v, ok := bd["kms_key_id"].(string); ok && v != "" {
+				ebs.KmsKeyId = aws.String(v)
 			}
 
 			if v, ok := bd["volume_size"].(int); ok && v != 0 {
@@ -698,21 +742,20 @@ func resourceAwsSpotFleetRequestCreate(d *schema.ResourceData, meta interface{})
 	// take effect immediately, resulting in an InvalidSpotFleetRequestConfig error
 	var resp *ec2.RequestSpotFleetOutput
 	err = resource.Retry(10*time.Minute, func() *resource.RetryError {
-		var err error
 		resp, err = conn.RequestSpotFleet(spotFleetOpts)
 
+		if isAWSErr(err, "InvalidSpotFleetRequestConfig", "") {
+			return resource.RetryableError(fmt.Errorf("Error creating Spot fleet request, retrying: %s", err))
+		}
 		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				// IAM is eventually consistent :/
-				if awsErr.Code() == "InvalidSpotFleetRequestConfig" {
-					return resource.RetryableError(
-						fmt.Errorf("Error creating Spot fleet request, retrying: %s", err))
-				}
-			}
 			return resource.NonRetryableError(err)
 		}
 		return nil
 	})
+
+	if isResourceTimeoutError(err) {
+		resp, err = conn.RequestSpotFleet(spotFleetOpts)
+	}
 
 	if err != nil {
 		return fmt.Errorf("Error requesting spot fleet: %s", err)
@@ -929,25 +972,30 @@ func resourceAwsSpotFleetRequestRead(d *schema.ResourceData, meta interface{}) e
 			aws.TimeValue(config.ValidUntil).Format(time.RFC3339))
 	}
 
+	launchSpec, err := launchSpecsToSet(config.LaunchSpecifications, conn)
+	if err != nil {
+		return fmt.Errorf("error occurred while reading launch specification: %s", err)
+	}
+
 	d.Set("replace_unhealthy_instances", config.ReplaceUnhealthyInstances)
 	d.Set("instance_interruption_behaviour", config.InstanceInterruptionBehavior)
 	d.Set("fleet_type", config.Type)
-	d.Set("launch_specification", launchSpecsToSet(config.LaunchSpecifications, conn))
+	d.Set("launch_specification", launchSpec)
 
 	return nil
 }
 
-func launchSpecsToSet(launchSpecs []*ec2.SpotFleetLaunchSpecification, conn *ec2.EC2) *schema.Set {
+func launchSpecsToSet(launchSpecs []*ec2.SpotFleetLaunchSpecification, conn *ec2.EC2) (*schema.Set, error) {
 	specSet := &schema.Set{F: hashLaunchSpecification}
 	for _, spec := range launchSpecs {
 		rootDeviceName, err := fetchRootDeviceName(aws.StringValue(spec.ImageId), conn)
 		if err != nil {
-			log.Panic(err)
+			return nil, err
 		}
 
 		specSet.Add(launchSpecToMap(spec, rootDeviceName))
 	}
-	return specSet
+	return specSet, nil
 }
 
 func launchSpecToMap(l *ec2.SpotFleetLaunchSpecification, rootDevName *string) map[string]interface{} {
@@ -1023,8 +1071,8 @@ func launchSpecToMap(l *ec2.SpotFleetLaunchSpecification, rootDevName *string) m
 	if l.TagSpecifications != nil {
 		for _, tagSpecs := range l.TagSpecifications {
 			// only "instance" tags are currently supported: http://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_SpotFleetTagSpecification.html
-			if *(tagSpecs.ResourceType) == "instance" {
-				m["tags"] = tagsToMap(tagSpecs.Tags)
+			if aws.StringValue(tagSpecs.ResourceType) == ec2.ResourceTypeInstance {
+				m["tags"] = keyvaluetags.Ec2KeyValueTags(tagSpecs.Tags).IgnoreAws().Map()
 			}
 		}
 	}
@@ -1059,6 +1107,10 @@ func ebsBlockDevicesToSet(bdm []*ec2.BlockDeviceMapping, rootDevName *string) *s
 
 			if ebs.Encrypted != nil {
 				m["encrypted"] = aws.BoolValue(ebs.Encrypted)
+			}
+
+			if ebs.KmsKeyId != nil {
+				m["kms_key_id"] = aws.StringValue(ebs.KmsKeyId)
 			}
 
 			if ebs.VolumeSize != nil {
@@ -1113,6 +1165,14 @@ func rootBlockDeviceToSet(
 					m["delete_on_termination"] = aws.BoolValue(val.Ebs.DeleteOnTermination)
 				}
 
+				if val.Ebs.Encrypted != nil {
+					m["encrypted"] = aws.BoolValue(val.Ebs.Encrypted)
+				}
+
+				if val.Ebs.KmsKeyId != nil {
+					m["kms_key_id"] = aws.StringValue(val.Ebs.KmsKeyId)
+				}
+
 				if val.Ebs.VolumeSize != nil {
 					m["volume_size"] = aws.Int64Value(val.Ebs.VolumeSize)
 				}
@@ -1137,8 +1197,6 @@ func resourceAwsSpotFleetRequestUpdate(d *schema.ResourceData, meta interface{})
 	// http://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifySpotFleetRequest.html
 	conn := meta.(*AWSClient).ec2conn
 
-	d.Partial(true)
-
 	req := &ec2.ModifySpotFleetRequestInput{
 		SpotFleetRequestId: aws.String(d.Id()),
 	}
@@ -1151,9 +1209,8 @@ func resourceAwsSpotFleetRequestUpdate(d *schema.ResourceData, meta interface{})
 		req.ExcessCapacityTerminationPolicy = aws.String(val.(string))
 	}
 
-	resp, err := conn.ModifySpotFleetRequest(req)
-	if err == nil && aws.BoolValue(resp.Return) {
-		// TODO: rollback to old values?
+	if _, err := conn.ModifySpotFleetRequest(req); err != nil {
+		return fmt.Errorf("error updating spot request (%s): %s", d.Id(), err)
 	}
 
 	return nil
@@ -1187,24 +1244,50 @@ func deleteSpotFleetRequest(spotFleetRequestID string, terminateInstances bool, 
 		return nil
 	}
 
-	return resource.Retry(timeout, func() *resource.RetryError {
+	activeInstances := func(fleetRequestID string) (int, error) {
 		resp, err := conn.DescribeSpotFleetInstances(&ec2.DescribeSpotFleetInstancesInput{
-			SpotFleetRequestId: aws.String(spotFleetRequestID),
+			SpotFleetRequestId: aws.String(fleetRequestID),
 		})
+
+		if err != nil || resp == nil {
+			return 0, fmt.Errorf("error reading Spot Fleet Instances (%s): %s", spotFleetRequestID, err)
+		}
+
+		return len(resp.ActiveInstances), nil
+	}
+
+	err = resource.Retry(timeout, func() *resource.RetryError {
+		n, err := activeInstances(spotFleetRequestID)
 		if err != nil {
 			return resource.NonRetryableError(err)
 		}
 
-		if len(resp.ActiveInstances) == 0 {
-			log.Printf("[DEBUG] Active instance count is 0 for Spot Fleet Request (%s), removing", spotFleetRequestID)
-			return nil
+		if n > 0 {
+			log.Printf("[DEBUG] Active instance count in Spot Fleet Request (%s): %d", spotFleetRequestID, n)
+			return resource.RetryableError(fmt.Errorf("fleet still has (%d) running instances", n))
 		}
 
-		log.Printf("[DEBUG] Active instance count in Spot Fleet Request (%s): %d", spotFleetRequestID, len(resp.ActiveInstances))
-
-		return resource.RetryableError(
-			fmt.Errorf("fleet still has (%d) running instances", len(resp.ActiveInstances)))
+		log.Printf("[DEBUG] Active instance count is 0 for Spot Fleet Request (%s), removing", spotFleetRequestID)
+		return nil
 	})
+
+	if isResourceTimeoutError(err) {
+		n, err := activeInstances(spotFleetRequestID)
+		if err != nil {
+			return err
+		}
+
+		if n > 0 {
+			log.Printf("[DEBUG] Active instance count in Spot Fleet Request (%s): %d", spotFleetRequestID, n)
+			return fmt.Errorf("fleet still has (%d) running instances", n)
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("error reading Spot Fleet Instances (%s): %s", spotFleetRequestID, err)
+	}
+
+	return nil
 }
 
 func hashEphemeralBlockDevice(v interface{}) int {

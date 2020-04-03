@@ -1,12 +1,12 @@
 ---
+subcategory: "RAM"
 layout: "aws"
 page_title: "AWS: aws_ram_resource_association"
-sidebar_current: "docs-aws-resource-ram-resource-association"
 description: |-
   Manages a Resource Access Manager (RAM) Resource Association.
 ---
 
-# aws_ram_resource_association
+# Resource: aws_ram_resource_association
 
 Manages a Resource Access Manager (RAM) Resource Association.
 
@@ -17,7 +17,7 @@ Manages a Resource Access Manager (RAM) Resource Association.
 ```hcl
 resource "aws_ram_resource_association" "example" {
   resource_arn       = "${aws_subnet.example.arn}"
-  resource_share_arn = "${aws_ram_resource_share.example.id}"
+  resource_share_arn = "${aws_ram_resource_share.example.arn}"
 }
 ```
 
